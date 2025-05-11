@@ -1,0 +1,80 @@
+BEGIN LinearSearch(array)
+    INPUT number
+    FOR index = 0 TO index = (LENGTH OF array) STEP 1
+        item = array[index]
+        IF item == number THEN
+            DISPLAY "Found"
+            RETURN
+        ENDIF
+    NEXT index
+END LinearSearch
+
+BEGIN BinarySearch(sorted_array)
+    INPUT number
+    low = 0
+    high = (LENGTH OF sorted_array) - 1
+    WHILE low < high
+        mid = (low + high) // 2
+        IF number <= sorted_array[mid] THEN
+            high = mid
+        ELSE
+            low = mid + 1
+        ENDIF
+    ENDWHILE
+    IF number == sorted_array[low] THEN
+        DISPLAY "Found"
+END BinarySearch
+
+BEGIN SelectionSort(array)
+    result = []
+    WHILE (LENGTH OF array) > 0
+        minimum_index = NULL
+        minimum_item = NULL
+        FOR index = 0 to index = (LENGTH OF array) STEP 1
+            IF minimum == NULL OR (array[index] < minimum_item) THEN
+                minimum_index = index
+                minimum_item = array[index]
+            ENDIF
+        NEXT index
+        APPEND array[minimum_index] TO result
+        REMOVE array[minimum_index] FROM array
+    ENDWHILE
+    RETURN result
+END SelectionSort
+
+BEGIN MergeSort(array)
+    IF (LENGTH OF array) <= 1 THEN
+        RETURN array
+    ENDIF
+    ; implementation note: `array[a : b] is the slice of
+    ; `array` from index `a` (inclusive) to `b` (exclusive)`,
+    ; and `//` denotes integer division
+    left = array[0:(LENGTH OF array) // 2]
+    right = array[(LENGTH OF array) // 2:(LENGTH OF array)]
+    left = MergeSort(left)
+    right = MergeSort(right)
+    merged = []
+    WHILE (LENGTH OF left) > 0 AND (LENGTH OF right) > 0
+        IF left[0] <= right[0] THEN
+            APPEND left[0] TO merged
+            REMOVE left[0] FROM left
+        ELSE
+            APPEND right[0] TO merged
+            REMOVE right[0] FROM right
+        ENDIF
+    ENDWHILE
+    FOR index = 0 TO index = (LENGTH OF left) STEP 1
+        APPEND left[index] TO merged
+    NEXT index
+    FOR index = 0 TO index = (LENGTH OF right) STEP 1
+        APPEND right[index] TO merged
+    NEXT index
+    RETURN merged
+END MergeSort
+
+BEGIN Main
+    LinearSearch([1, 2, 3, 4, 5])
+    BinarySearch([1, 2, 3, 4, 5])
+    DISPLAY SelectionSort([8, 5, 2, 7, 6, 1, 3, 4])
+    DISPLAY MergeSort([8, 5, 2, 7, 6, 1, 3, 4])
+END Main
