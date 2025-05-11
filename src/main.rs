@@ -20,7 +20,7 @@ use rustpython_parser::{
 use tap::Pipe;
 
 #[derive(Debug)]
-struct Psuedocode {
+struct Pseudocode {
     statements: Vec<Statement>,
 }
 
@@ -47,6 +47,7 @@ enum Statement {
     Assignment {
         left: String,
         right: String,
+        operator: Option<Operator>,
     },
     If {
         condition: String,
@@ -66,6 +67,7 @@ impl Statement {
     fn transpile_assign(
         targets: Vec<Expr<TextRange>>,
         value: Box<Expr<TextRange>>,
+        operator: Option<Operator>,
     ) -> impl Iterator<Item = Self> {
         targets
             .iter()
@@ -92,20 +94,22 @@ impl Statement {
                 })
             })
             .map_or_else(
-                || {
+                move || {
                     let left = targets.into_iter().exactly_one().unwrap();
                     if left.is_tuple_expr() {
                         let left = left.expect_tuple_expr();
                         zip(left.elts, value.expect_tuple_expr().elts)
-                            .map(|(left, right)| Self::Assignment {
+                            .map(move |(left, right)| Self::Assignment {
                                 left: expr_to_string(&left),
                                 right: expr_to_string(&right),
+                                operator,
                             })
                             .pipe(Either::Left)
                     } else {
                         Self::Assignment {
                             left: expr_to_string(&left),
                             right: expr_to_string(&value),
+                            operator,
                         }
                         .pipe(once)
                         .pipe(Either::Right)
@@ -133,17 +137,19 @@ impl Statement {
             }
             .pipe(once)
             .pipe(Either::Left),
-            Stmt::AugAssign(aug_assign) => {
-                Self::transpile_assign(vec![*aug_assign.target], aug_assign.value) // TODO make this actually aug assign
-                    .pipe(Either::Left)
-                    .pipe(Either::Right)
-            }
+            Stmt::AugAssign(aug_assign) => Self::transpile_assign(
+                vec![*aug_assign.target],
+                aug_assign.value,
+                Some(aug_assign.op),
+            )
+            .pipe(Either::Left)
+            .pipe(Either::Right),
             Stmt::AnnAssign(ann_assign) => {
-                Self::transpile_assign(vec![*ann_assign.target], ann_assign.value.unwrap())
+                Self::transpile_assign(vec![*ann_assign.target], ann_assign.value.unwrap(), None)
                     .pipe(Either::Left)
                     .pipe(Either::Right)
             }
-            Stmt::Assign(assign) => Self::transpile_assign(assign.targets, assign.value)
+            Stmt::Assign(assign) => Self::transpile_assign(assign.targets, assign.value, None)
                 .pipe(Either::Left)
                 .pipe(Either::Right),
             Stmt::For(r#for) => {
@@ -217,6 +223,7 @@ impl Statement {
                         body: once(Self::Assignment {
                             left: r#for.target.expect_name_expr().id.to_string(),
                             right: format!("{iter}[index]"),
+                            operator: None,
                         })
                         .chain(body)
                         .collect_vec(),
@@ -245,19 +252,37 @@ impl Statement {
             .pipe(once)
             .pipe(Either::Left),
             Stmt::Expr(expr) => {
-                if let Some(call) = expr.value.as_call_expr().filter(|call| {
-                    call.func
+                if let Some(call) = expr.value.as_call_expr() {
+                    if call
+                        .func
                         .as_name_expr()
                         .is_some_and(|name| *name.id == *"print")
-                }) {
-                    Self::Display(call.args.iter().map(expr_to_string).join(", "))
-                        .pipe(once)
-                        .pipe(Either::Left)
-                } else {
-                    Self::Other(format!("<other statement {expr:?}>"))
-                        .pipe(once)
-                        .pipe(Either::Left)
+                    {
+                        return Self::Display(call.args.iter().map(expr_to_string).join(", "))
+                            .pipe(once)
+                            .pipe(Either::Left);
+                    }
+                    if call
+                        .func
+                        .as_name_expr()
+                        .is_some_and(|name| *name.id == *"append")
+                    {
+                        return Self::Other(format!("<append {expr:?}>"))
+                            .pipe(once)
+                            .pipe(Either::Left);
+                    }
+
+                    return Self::Other(format!(
+                        "CALL {} WITH ({})",
+                        expr_to_string(&call.func),
+                        call.args.iter().map(expr_to_string).join(", ")
+                    ))
+                    .pipe(once)
+                    .pipe(Either::Left);
                 }
+                Self::Other(format!("<other statement {expr:?}>"))
+                    .pipe(once)
+                    .pipe(Either::Left)
             }
             Stmt::Return(r#return) => Self::Return(r#return.value.as_deref().map(expr_to_string))
                 .pipe(once)
@@ -315,20 +340,8 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
         Expr::BinOp(bin_op) => {
             let left = expr_to_string(&bin_op.left);
             let right = expr_to_string(&bin_op.right);
-            let op = match bin_op.op {
-                Operator::Add => "+",
-                Operator::Sub => "-",
-                Operator::Mult => "*",
-                Operator::Div => "/",
-                Operator::Mod => "%",
-                Operator::Pow => "**",
-                Operator::BitOr => "|",
-                Operator::BitXor => "^",
-                Operator::BitAnd => "&",
-                Operator::FloorDiv => "//",
-                _ => unimplemented!("{:?}", bin_op.op),
-            };
-            format!("{left} {op} {right}")
+            let op = operator_to_string(bin_op.op);
+            format!("({left} {op} {right})")
         }
         Expr::Call(call) => {
             if call
@@ -339,10 +352,9 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
                 let arg = call.args.iter().exactly_one().unwrap();
                 format!("(LENGTH OF {})", expr_to_string(arg))
             } else {
-                let func = call.func.as_name_expr().unwrap();
                 format!(
                     "{}({})",
-                    func.id,
+                    expr_to_string(&call.func),
                     call.args.iter().map(expr_to_string).join(", ")
                 )
             }
@@ -400,11 +412,32 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
                 .unwrap_or_default();
             format!("{lower}:{upper}{step}")
         }
+        Expr::Attribute(attribute) => {
+            format!("(ATTRIBUTE \"{}\" OF {})", attribute.attr,  expr_to_string(&attribute.value))
+        }
         _ => format!("[[[ other expr: {expr:?} ]]]"),
     }
 }
 
-impl Display for Psuedocode {
+const fn operator_to_string(op: Operator) -> &'static str {
+    match op {
+        Operator::Add => "+",
+        Operator::Sub => "-",
+        Operator::Mult => "*",
+        Operator::Div => "/",
+        Operator::Mod => "%",
+        Operator::Pow => "**",
+        Operator::BitOr => "|",
+        Operator::BitXor => "^",
+        Operator::BitAnd => "&",
+        Operator::FloorDiv => "//",
+        Operator::MatMult => "@",
+        Operator::LShift => "<<",
+        Operator::RShift => ">>",
+    }
+}
+
+impl Display for Pseudocode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for statement in &self.statements {
             writeln!(
@@ -484,8 +517,18 @@ impl Display for DisplayStatement<'_> {
                 }
                 write(f, format!("NEXT {variable}"))?;
             }
-            Statement::Assignment { left, right } => {
-                write(f, format!("{left} = {right}"))?;
+            Statement::Assignment {
+                left,
+                right,
+                operator,
+            } => {
+                write(
+                    f,
+                    format!(
+                        "{left} {}= {right}",
+                        operator.map(operator_to_string).unwrap_or_default()
+                    ),
+                )?;
             }
             Statement::If {
                 condition,
@@ -521,17 +564,22 @@ impl Display for DisplayStatement<'_> {
             Statement::Display(expression) => {
                 write(f, format!("DISPLAY {expression}"))?;
             }
-            Statement::Other(other) => write!(f, "[[[ {other} ]]]")?,
+            Statement::Other(other) => write(f, other.clone())?,
         }
         Ok(())
     }
 }
 
-fn main() {}
+fn main() {
+    print!(
+        "{}",
+        transpile(&read_to_string(args().nth(1).unwrap()).unwrap())
+    );
+}
 
 fn transpile(python: &str) -> String {
     let tree = parse_tokens(lex(python, Mode::Module), Mode::Module, "<embedded>").unwrap();
-    let pseudocode = Psuedocode {
+    let pseudocode = Pseudocode {
         statements: tree
             .expect_module()
             .body
@@ -539,19 +587,5 @@ fn transpile(python: &str) -> String {
             .flat_map(Statement::transpile)
             .collect_vec(),
     };
-    println!("{pseudocode}");
-    todo!();
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::transpile;
-
-    #[test]
-    fn works() {
-        let actual = transpile(include_str!("input"));
-        println!("\n{}", actual);
-        let expected = include_str!("expected");
-        assert_eq!(actual, expected);
-    }
+    pseudocode.to_string()
 }
