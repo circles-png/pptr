@@ -12,7 +12,7 @@ use convert_case::{Case, Casing};
 use itertools::{Either, Itertools};
 use rustpython_parser::{
     Mode,
-    ast::{BoolOp, CmpOp, Constant, Expr, Operator, Stmt, UnaryOp},
+    ast::{BoolOp, CmpOp, Constant, Expr, ExprConstant, Operator, Pattern, Stmt, UnaryOp},
     lexer::lex,
     parse_tokens,
     text_size::TextRange,
@@ -60,7 +60,12 @@ enum Statement {
         body: Vec<Statement>,
     },
     Display(String),
+    Break,
     Other(String),
+    CaseWhere {
+        scrutinee: String,
+        cases: Vec<(String, Vec<Statement>)>,
+    },
 }
 
 impl Statement {
@@ -166,22 +171,22 @@ impl Statement {
                         [end] => Self::ForNext {
                             variable,
                             from: "0".to_string(),
-                            to: format!("<range arg {end:?}>"),
+                            to: expr_to_string(end),
                             step: "1".to_string(),
                             body,
                         },
                         [start, end] => Self::ForNext {
                             variable,
-                            from: format!("<range arg {start:?}>"),
-                            to: format!("<range arg {end:?}>"),
+                            from: expr_to_string(start),
+                            to: expr_to_string(end),
                             step: "1".to_string(),
                             body,
                         },
                         [start, end, step] => Self::ForNext {
                             variable,
-                            from: format!("<range arg {start:?}>"),
-                            to: format!("<range arg {end:?}>"),
-                            step: format!("<range arg {step:?}>"),
+                            from: expr_to_string(start),
+                            to: expr_to_string(end),
+                            step: expr_to_string(step),
                             body,
                         },
                         _ => unreachable!("bad range: {:?}", call),
@@ -286,6 +291,9 @@ impl Statement {
                     .pipe(once)
                     .pipe(Box::new);
                 }
+                if expr.value.is_constant_expr() {
+                    return empty().pipe(Box::new);
+                }
                 Self::Other(format!("<other statement {expr:?}>"))
                     .pipe(once)
                     .pipe(Box::new)
@@ -303,27 +311,76 @@ impl Statement {
             }
             .pipe(once)
             .pipe(Box::new),
-            Stmt::Assert(_) => empty().pipe(Box::new),
+            Stmt::Assert(_) | Stmt::Import(_) | Stmt::ImportFrom(_) => empty().pipe(Box::new),
+            Stmt::Break(_) => Self::Break.pipe(once).pipe(Box::new),
+            Stmt::Match(r#match) => Self::CaseWhere {
+                scrutinee: expr_to_string(&r#match.subject),
+                cases: r#match
+                    .cases
+                    .into_iter()
+                    .filter_map(|case| {
+                        (
+                            pattern_to_string(case.pattern)?,
+                            case.body
+                                .into_iter()
+                                .flat_map(Self::transpile)
+                                .collect_vec(),
+                        )
+                            .pipe(Some)
+                    })
+                    .collect_vec(),
+            }
+            .pipe(once)
+            .pipe(Box::new),
             _ => todo!("transpile statement:\n\n{statement:?}"),
         }
     }
 }
 
+fn pattern_to_string(pattern: Pattern) -> Option<String> {
+    match pattern {
+        Pattern::MatchValue(pattern_match_value) => expr_to_string(&pattern_match_value.value),
+        Pattern::MatchSingleton(pattern_match_singleton) => {
+            constant_to_string(&pattern_match_singleton.value)
+        }
+        Pattern::MatchSequence(pattern_match_sequence) => format!(
+            "({})",
+            pattern_match_sequence
+                .patterns
+                .into_iter()
+                .filter_map(pattern_to_string)
+                .join(",")
+        ),
+        Pattern::MatchMapping(pattern_match_mapping) => {
+            todo!("casewhere pattern mapping: {pattern_match_mapping:?}")
+        }
+        Pattern::MatchClass(pattern_match_class) => {
+            todo!("casewhere pattern class: {pattern_match_class:?}")
+        }
+        Pattern::MatchStar(pattern_match_star) => {
+            todo!("casewhere pattern star: {pattern_match_star:?}")
+        }
+        Pattern::MatchAs(_) => return None,
+        Pattern::MatchOr(pattern_match_or) => {
+            format!(
+                "({})",
+                pattern_match_or
+                    .patterns
+                    .into_iter()
+                    .filter_map(pattern_to_string)
+                    .join(" OR ")
+            )
+        }
+    }
+    .pipe(Some)
+}
+
 fn expr_to_string(expr: &Expr<TextRange>) -> String {
     match expr {
         Expr::Name(name) => name.id.to_string(),
-        Expr::Constant(constant) => match &constant.value {
-            Constant::Bool(true) => "TRUE".to_string(),
-            Constant::Bool(false) => "FALSE".to_string(),
-            Constant::Str(string) => format!("\"{string}\""),
-            Constant::Int(int) => format!("{int}"),
-            Constant::Float(float) => format!("{float}"),
-            Constant::Bytes(bytes) => format!("{bytes:?}"),
-            Constant::None => "NULL".to_string(),
-            Constant::Tuple(_) => unimplemented!(),
-            Constant::Complex { .. } => unimplemented!(),
-            Constant::Ellipsis => unimplemented!(),
-        },
+        Expr::Constant(constant) => constant_to_string(&constant.value),
+        Expr::JoinedStr(joined_str) => joined_str.values.iter().map(expr_to_string).join(", "),
+        Expr::FormattedValue(formatted_value) => expr_to_string(&formatted_value.value),
         Expr::Compare(compare) => {
             let left = expr_to_string(&compare.left);
             let right = expr_to_string(compare.comparators.iter().exactly_one().unwrap());
@@ -355,7 +412,7 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
                 format!("(LENGTH OF {})", expr_to_string(arg))
             } else {
                 format!(
-                    "CALL {} WITH ({})",
+                    "(CALL {} WITH ({}))",
                     expr_to_string(&call.func),
                     call.args.iter().map(expr_to_string).join(", ")
                 )
@@ -421,7 +478,28 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
                 expr_to_string(&attribute.value)
             )
         }
+        Expr::IfExp(if_exp) => format!(
+            "(IF {} THEN {} ELSE {})",
+            expr_to_string(&if_exp.test),
+            expr_to_string(&if_exp.body),
+            expr_to_string(&if_exp.orelse)
+        ),
         _ => format!("[[[ other expr: {expr:?} ]]]"),
+    }
+}
+
+fn constant_to_string(constant: &Constant) -> String {
+    match constant {
+        Constant::Bool(true) => "TRUE".to_string(),
+        Constant::Bool(false) => "FALSE".to_string(),
+        Constant::Str(string) => format!("{string:?}"),
+        Constant::Int(int) => format!("{int}"),
+        Constant::Float(float) => format!("{float}"),
+        Constant::Bytes(bytes) => format!("{bytes:?}"),
+        Constant::None => "NULL".to_string(),
+        Constant::Tuple(_) => unimplemented!(),
+        Constant::Complex { .. } => unimplemented!(),
+        Constant::Ellipsis => unimplemented!(),
     }
 }
 
@@ -569,6 +647,19 @@ impl Display for DisplayStatement<'_> {
             }
             Statement::Display(expression) => {
                 write(f, format!("DISPLAY {expression}"))?;
+            }
+            Statement::Break => write(f, "BREAK".to_string())?,
+            Statement::CaseWhere { scrutinee, cases } => {
+                writeln(f, format!("CASEWHERE {scrutinee} evaluates to"))?;
+                for (case, body) in cases {
+                    write!(f, "    ")?;
+                    writeln(f, format!("{case}:"))?;
+                    for statement in body {
+                        write!(f, "    ")?;
+                        writeln_statement(f, statement)?;
+                    }
+                }
+                write(f, "END CASE".to_string())?;
             }
             Statement::Other(other) => write(f, other.clone())?,
         }
