@@ -119,7 +119,7 @@ impl Statement {
                 |out| Self::Input { out }.pipe(once).pipe(Either::Left),
             )
     }
-    fn transpile(statement: Stmt) -> impl Iterator<Item = Self> {
+    fn transpile(statement: Stmt) -> Box<dyn Iterator<Item = Self>> {
         match statement {
             Stmt::FunctionDef(function_def) => Self::Process {
                 name: function_def.name.to_string().to_case(Case::Pascal),
@@ -136,22 +136,20 @@ impl Statement {
                     .collect_vec(),
             }
             .pipe(once)
-            .pipe(Either::Left),
+            .pipe(Box::new),
             Stmt::AugAssign(aug_assign) => Self::transpile_assign(
                 vec![*aug_assign.target],
                 aug_assign.value,
                 Some(aug_assign.op),
             )
-            .pipe(Either::Left)
-            .pipe(Either::Right),
+            .pipe(Box::new),
             Stmt::AnnAssign(ann_assign) => {
                 Self::transpile_assign(vec![*ann_assign.target], ann_assign.value.unwrap(), None)
-                    .pipe(Either::Left)
-                    .pipe(Either::Right)
+                    .pipe(Box::new)
             }
-            Stmt::Assign(assign) => Self::transpile_assign(assign.targets, assign.value, None)
-                .pipe(Either::Left)
-                .pipe(Either::Right),
+            Stmt::Assign(assign) => {
+                Self::transpile_assign(assign.targets, assign.value, None).pipe(Box::new)
+            }
             Stmt::For(r#for) => {
                 let body = r#for
                     .body
@@ -189,13 +187,13 @@ impl Statement {
                         _ => unreachable!("bad range: {:?}", call),
                     }
                     .pipe(once)
-                    .pipe(Either::Left)
+                    .pipe(Box::new)
                 } else if let Some(call) = r#for.iter.as_call_expr().filter(|call| {
                     call.func
                         .as_name_expr()
                         .is_some_and(|name| *name.id == *"enumerate")
                 }) {
-                    [Self::ForNext {
+                    Self::ForNext {
                         variable: "index".to_string(),
                         from: "0".to_string(),
                         to: format!(
@@ -209,13 +207,24 @@ impl Statement {
                                 .id
                         ),
                         step: "1".to_string(),
-                        body,
-                    }]
-                    .into_iter()
-                    .pipe(Either::Right)
+                        body: once(Self::Assignment {
+                            left: expr_to_string(
+                                r#for.target.expect_tuple_expr().elts.last().unwrap(),
+                            ),
+                            right: format!(
+                                "{}[index]",
+                                expr_to_string(call.args.iter().exactly_one().ok().unwrap())
+                            ),
+                            operator: None,
+                        })
+                        .chain(body)
+                        .collect_vec(),
+                    }
+                    .pipe(once)
+                    .pipe(Box::new)
                 } else {
                     let iter = r#for.iter.expect_name_expr().id;
-                    [Self::ForNext {
+                    Self::ForNext {
                         variable: "index".to_string(),
                         from: "0".to_string(),
                         to: format!("(LENGTH OF {iter})"),
@@ -227,13 +236,10 @@ impl Statement {
                         })
                         .chain(body)
                         .collect_vec(),
-                    }]
-                    .into_iter()
-                    .pipe(Either::Right)
+                    }
+                    .pipe(once)
+                    .pipe(Box::new)
                 }
-                .pipe(Either::Left)
-                .pipe(Either::Right)
-                .pipe(Either::Right)
             }
             Stmt::If(r#if) => Self::If {
                 condition: expr_to_string(&r#if.test),
@@ -250,7 +256,7 @@ impl Statement {
                 }),
             }
             .pipe(once)
-            .pipe(Either::Left),
+            .pipe(Box::new),
             Stmt::Expr(expr) => {
                 if let Some(call) = expr.value.as_call_expr() {
                     if call
@@ -260,7 +266,7 @@ impl Statement {
                     {
                         return Self::Display(call.args.iter().map(expr_to_string).join(", "))
                             .pipe(once)
-                            .pipe(Either::Left);
+                            .pipe(Box::new);
                     }
                     if call
                         .func
@@ -269,7 +275,7 @@ impl Statement {
                     {
                         return Self::Other(format!("<append {expr:?}>"))
                             .pipe(once)
-                            .pipe(Either::Left);
+                            .pipe(Box::new);
                     }
 
                     return Self::Other(format!(
@@ -278,15 +284,15 @@ impl Statement {
                         call.args.iter().map(expr_to_string).join(", ")
                     ))
                     .pipe(once)
-                    .pipe(Either::Left);
+                    .pipe(Box::new);
                 }
                 Self::Other(format!("<other statement {expr:?}>"))
                     .pipe(once)
-                    .pipe(Either::Left)
+                    .pipe(Box::new)
             }
             Stmt::Return(r#return) => Self::Return(r#return.value.as_deref().map(expr_to_string))
                 .pipe(once)
-                .pipe(Either::Left),
+                .pipe(Box::new),
             Stmt::While(r#while) => Self::While {
                 condition: expr_to_string(&r#while.test),
                 body: r#while
@@ -296,12 +302,8 @@ impl Statement {
                     .collect_vec(),
             }
             .pipe(once)
-            .pipe(Either::Left),
-            Stmt::Assert(_) => empty()
-                .pipe(Either::<_, Empty<Self>>::Left)
-                .pipe(Either::Right)
-                .pipe(Either::Right)
-                .pipe(Either::Right),
+            .pipe(Box::new),
+            Stmt::Assert(_) => empty().pipe(Box::new),
             _ => todo!("transpile statement:\n\n{statement:?}"),
         }
     }
@@ -353,7 +355,7 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
                 format!("(LENGTH OF {})", expr_to_string(arg))
             } else {
                 format!(
-                    "{}({})",
+                    "CALL {} WITH ({})",
                     expr_to_string(&call.func),
                     call.args.iter().map(expr_to_string).join(", ")
                 )
@@ -413,7 +415,11 @@ fn expr_to_string(expr: &Expr<TextRange>) -> String {
             format!("{lower}:{upper}{step}")
         }
         Expr::Attribute(attribute) => {
-            format!("(ATTRIBUTE \"{}\" OF {})", attribute.attr,  expr_to_string(&attribute.value))
+            format!(
+                "(ATTRIBUTE \"{}\" OF {})",
+                attribute.attr,
+                expr_to_string(&attribute.value)
+            )
         }
         _ => format!("[[[ other expr: {expr:?} ]]]"),
     }
