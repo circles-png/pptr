@@ -84,6 +84,10 @@ impl Statement {
                 value.as_call_expr().is_some_and(|call| {
                     call.func
                         .as_name_expr()
+                        .is_some_and(|name| *name.id == *"input")
+                        ||
+                    (call.func
+                        .as_name_expr()
                         .is_some_and(|name| ["int"].contains(&&*name.id))
                         && call
                             .args
@@ -95,7 +99,7 @@ impl Statement {
                                 call.func
                                     .as_name_expr()
                                     .is_some_and(|name| *name.id == *"input")
-                            })
+                            }))
                 })
             })
             .map_or_else(
